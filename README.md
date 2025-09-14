@@ -102,6 +102,21 @@ Delete the existing firmware if needed.
 ```
 espflash erase-flash
 ```
+## WakeNetWord Model Generate and Load
+You will need to download from [esp sr](https://github.com/espressif/esp-SR), and then choose model wn9_helexin,create a directory named build_path manually,run the command:
+```
+python ./model/movemodel.py -d1 ./test_apps/esp-sr/sdkconfig.ci.wn9_hilexin -d2 . -d3 ./build_path
+```
+run the command:
+```
+espflash partition-table partitions.csv
+```
+to query model memory offset address like 0x710000,
+run the command:
+```
+espflash write-bin 0x710000 --baud 921600 srmodels.bin
+```
+to load model into flash.
 
 ## Next steps
 
