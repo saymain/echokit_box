@@ -12,7 +12,10 @@ unsafe fn afe_init() -> (
     *mut esp_sr::esp_afe_sr_iface_t,
     *mut esp_sr::esp_afe_sr_data_t,
 ) {
-    let models = esp_sr::esp_srmodel_init("model\0".as_ptr() as *const _);
+    let models = esp_sr::esp_srmodel_init("model\0".as_ptr() as *const _);    
+    if models.is_null() {
+        log::info!("Failed to initialize models");    
+    }
     let afe_config = esp_sr::afe_config_init(
         "M\0".as_ptr() as _,
         models,
@@ -28,6 +31,17 @@ unsafe fn afe_init() -> (
     afe_config.vad_min_noise_ms = 500;
     afe_config.vad_mode = esp_sr::vad_mode_t_VAD_MODE_1;
     afe_config.agc_init = true;
+    //使用WakeNet唤醒词
+    afe_config.wakenet_init = true;
+    
+    // 打印唤醒词模型信息
+    if !afe_config.wakenet_model_name.is_null() {
+        log::info!("wakeword model in AFE config:{:?}",afe_config.wakenet_model_name);    
+    }
+    // 打印唤醒词模型信息
+    if !afe_config.wakenet_model_name_2.is_null() {
+        log::info!("wakeword model in AFE config:{:?}",afe_config.wakenet_model_name_2);    
+    }
 
     log::info!("{afe_config:?}");
 
@@ -57,6 +71,7 @@ unsafe impl Sync for AFE {}
 struct AFEResult {
     data: Vec<u8>,
     speech: bool,
+    wake_word_state: WakeWordResult, // 添加唤醒词检测结果
 }
 
 impl AFE {
@@ -69,7 +84,7 @@ impl AFE {
             AFE {
                 handle,
                 data,
-                feed_chunksize,
+                feed_chunksize
             }
         }
     }
@@ -119,7 +134,15 @@ impl AFE {
             };
 
             let speech = vad_state == esp_sr::vad_state_t_VAD_SPEECH;
-            Ok(AFEResult { data, speech })
+
+            // 检查唤醒词检测状态（从main.c移植）
+            let wake_word_state = WakeWordResult {
+                detected: result.wakeup_state == esp_sr::wakenet_state_t_WAKENET_DETECTED,
+                model_index: result.wakenet_model_index,
+                word_index: result.wake_word_index,
+            };
+
+            Ok(AFEResult { data, speech,wake_word_state })
         }
     }
 }
@@ -410,12 +433,30 @@ async fn i2s_player(
 
 fn afe_worker(afe_handle: Arc<AFE>, tx: MicTx) -> anyhow::Result<()> {
     let mut speech = false;
+    let mut wake_word_detected = false;
+
     loop {
         let result = afe_handle.fetch();
         if let Err(_e) = &result {
             continue;
         }
         let result = result.unwrap();
+
+        // 处理唤醒词检测（从main.c移植）
+        if result.wake_word_state.detected && !wake_word_detected {
+            wake_word_detected = true;
+            log::info!("wakeword detected"); 
+            log::info!("model index:{}, word index:{}", 
+                result.wake_word_state.model_index, 
+                result.wake_word_state.word_index);
+            log::info!("-----------LISTENING-----------"); 
+            
+            // 发送唤醒词检测事件到主任务
+            if let Err(e) = tx.blocking_send(crate::app::Event::WakeWordDetected(result.wake_word_state)) {
+                log::error!("Failed to send wake word event: {:?}", e);
+            }
+        }
+
         if result.data.is_empty() {
             continue;
         }
@@ -433,37 +474,15 @@ fn afe_worker(afe_handle: Arc<AFE>, tx: MicTx) -> anyhow::Result<()> {
             tx.blocking_send(crate::app::Event::MicAudioEnd)
                 .map_err(|_| anyhow::anyhow!("Failed to send data"))?;
             speech = false;
+            wake_word_detected = false; // 重置唤醒词检测状态
         }
     }
 }
 
-const WELCOME_WAV: &[u8] = include_bytes!("../assets/welcome.wav");
-
-pub fn player_welcome(
-    i2s: I2S0,
-    bclk: AnyIOPin,
-    dout: AnyIOPin,
-    lrclk: AnyIOPin,
-    mclk: Option<AnyIOPin>,
-    data: Option<&[u8]>,
-) {
-    let i2s_config = config::StdConfig::new(
-        config::Config::default().auto_clear(true),
-        config::StdClkConfig::from_sample_rate_hz(SAMPLE_RATE),
-        config::StdSlotConfig::philips_slot_default(
-            config::DataBitWidth::Bits16,
-            config::SlotMode::Mono,
-        ),
-        config::StdGpioConfig::default(),
-    );
-
-    let mut tx_driver = I2sDriver::new_std_tx(i2s, &i2s_config, bclk, dout, mclk, lrclk).unwrap();
-
-    tx_driver.tx_enable().unwrap();
-
-    if let Some(data) = data {
-        tx_driver.write_all(data, 1000).unwrap();
-    } else {
-        tx_driver.write_all(WELCOME_WAV, 1000).unwrap();
-    }
+// 唤醒词检测结果
+#[derive(Debug)]
+pub struct WakeWordResult {
+    pub detected: bool,
+    pub model_index: i32,
+    pub word_index: i32,
 }
