@@ -2,7 +2,7 @@ use tokio::sync::mpsc;
 use tokio_websockets::Message;
 
 use crate::{
-    audio::{self, AudioData},
+    audio::{self, AudioData,WakeWordResult},    // 导入WakeWordResult
     protocol::ServerEvent,
     ws::Server,
 };
@@ -13,6 +13,7 @@ pub enum Event {
     ServerEvent(ServerEvent),
     MicAudioChunk(Vec<u8>),
     MicAudioEnd,
+    WakeWordDetected(WakeWordResult), // 新增：唤醒词检测事件
 }
 
 #[allow(dead_code)]
@@ -46,6 +47,9 @@ async fn select_evt(evt_rx: &mut mpsc::Receiver<Event>, server: &mut Server) -> 
                 Event::ServerEvent(_)=>{
                     log::info!("Received ServerEvent: {:?}", evt);
                 },
+                Event::WakeWordDetected(wakewordresult) => {
+                    log::info!("Received WakeWord Event: {:?}", wakewordresult);
+                }
             }
             Some(evt)
         }
@@ -121,8 +125,7 @@ pub async fn main_work<'d>(
     #[derive(PartialEq, Eq)]
     enum State {
         Listening,
-        Recording,
-        Wait,
+        Recording,        
         Speaking,
         Idle,
     }
@@ -130,12 +133,13 @@ pub async fn main_work<'d>(
     let mut gui = crate::ui::UI::new(backgroud_buffer)?;
 
     gui.state = "Idle".to_string();
+    gui.text = "等待唤醒词: 'Hi, 乐鑫'".to_string(); // 修改提示信息
     gui.display_flush().unwrap();
 
     let mut new_gui_bg = vec![];
 
     let mut state = State::Idle;
-
+    
     let mut submit_audio = 0.0;
 
     let mut audio_buffer = Vec::with_capacity(8192);
@@ -145,7 +149,58 @@ pub async fn main_work<'d>(
     let mut speed = 0.8;
 
     while let Some(evt) = select_evt(&mut evt_rx, &mut server).await {
-        match evt {
+        match evt {            
+            // 处理唤醒词检测事件
+            Event::WakeWordDetected(result) => {
+                log::info!("Wake word detected: model {}, word {}", 
+                    result.model_index, result.word_index);
+                if state == State::Idle {
+                    state = State::Listening;
+                    gui.state = "Listening...".to_string();
+                    gui.text = "唤醒词检测成功，正在监听...".to_string();
+                    gui.display_flush().unwrap();
+
+                    // 播放提示音
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    player_tx
+                        .send(AudioData::Hello(tx))
+                        .map_err(|e| anyhow::anyhow!("Error sending hello: {e:?}"))?;
+                    let _ = rx.await;
+                } else if state == State::Listening {
+                    state = State::Idle; 
+                    gui.state = "等待唤醒词".to_string();
+                    gui.text = "等待语音唤醒词: 'Hi, 乐鑫'".to_string();
+                    gui.display_flush().unwrap();
+
+                    // 播放提示音
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    player_tx
+                        .send(AudioData::Hello(tx))
+                        .map_err(|e| anyhow::anyhow!("Error sending hello: {e:?}"))?;
+                    let _ = rx.await;
+                }
+            }
+            
+            Event::Event(Event::GAIA | Event::K0) => {
+                log::info!("Received event: gaia");
+                if state == State::Listening {
+                    //state = State::WakeWordDetection; // 返回到唤醒词检测状态
+                    state = State::Idle;
+                    gui.state = "等待唤醒词".to_string();
+                    gui.text = "等待语音唤醒词: 'Hi, 乐鑫'".to_string();
+                    gui.display_flush().unwrap();
+                } else if state == State::Idle {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    player_tx
+                        .send(AudioData::Hello(tx))
+                        .map_err(|e| anyhow::anyhow!("Error sending hello: {e:?}"))?;
+                    let _ = rx.await;
+                    state = State::Listening;
+                    gui.state = "Listening...".to_string();
+                    gui.display_flush().unwrap();
+                }
+            }
+            /*
             Event::Event(Event::GAIA | Event::K0) => {
                 log::info!("Received event: gaia");
                 // gui.state = "gaia".to_string();
@@ -169,6 +224,7 @@ pub async fn main_work<'d>(
                     gui.display_flush().unwrap();
                 }
             }
+            */
             Event::Event(Event::K0_) => {
                 if state == State::Idle || state == State::Listening {
                     log::info!("Received event: K0_");
@@ -233,11 +289,22 @@ pub async fn main_work<'d>(
                 if need_compute {
                     metrics.reset();
                 }
+
+                // 先检查发送器状态
+                if player_tx.is_closed() {
+                    log::error!("Audio player channel is closed!");
+                    state = State::Idle;
+                    gui.state = "Audio Error".to_string();
+                    gui.text = "音频系统错误，请重启".to_string();
+                    gui.display_flush().unwrap();
+                    continue;
+                }
+
                 log::info!("Received audio start: {:?}", text);
                 state = State::Speaking;
                 gui.state = format!("[{:.2}x]|Speaking...", speed);
                 gui.text = text.trim().to_string();
-                gui.display_flush().unwrap();
+                gui.display_flush().unwrap();                
                 player_tx
                     .send(AudioData::Start)
                     .map_err(|e| anyhow::anyhow!("Error sending start: {e:?}"))?;
